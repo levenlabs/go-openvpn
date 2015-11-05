@@ -1,3 +1,5 @@
+// Package openvpn provides various methods for parsing and interacting with
+// the OpenVPN server.
 package openvpn
 
 import (
