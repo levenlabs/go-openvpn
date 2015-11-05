@@ -10,12 +10,22 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"fmt"
 )
 
-// Represents an INET address with an IP and Port
+// Represents an INET address with an IP and port
 type Addr struct {
 	IP   net.IP
 	Port int
+}
+
+// Represents an route address with an IP and mask
+type RouteAddr struct {
+	net.IPNet
+
+	// Remote means it was learned via the remote host
+	// The server is forwarding this route to that host
+	Remote bool
 }
 
 // Represents a OpenVPN client
@@ -29,7 +39,7 @@ type Client struct {
 
 // Represents a OpenVPN route
 type Route struct {
-	VirtualAddress net.IP
+	VirtualAddress RouteAddr
 	CommonName     string
 	RealAddress    Addr
 	LastRef        time.Time
@@ -74,6 +84,35 @@ func parseAddr(text string) (Addr, error) {
 	return a, nil
 }
 
+func parseRouteAddr(text string) (RouteAddr, error) {
+	r := RouteAddr{}
+	// detect if this is a remote addr
+	if strings.HasSuffix(text, "C") {
+		text = strings.TrimSuffix(text, "C")
+		r.Remote = true
+	}
+	// for some reason ipm.IP is 16 bytes for an IPv4, but ip is 4 bytes
+	// so we use ip instead
+	ip, ipm, err := net.ParseCIDR(text)
+	if err == nil {
+		r.IP = ip
+		r.Mask = ipm.Mask
+		return r, nil
+	}
+
+	//it might not be a CIDR and instead just an IP
+	r.IP = net.ParseIP(text)
+	if r.IP == nil {
+		return r, err
+	}
+
+	r.Mask = net.CIDRMask(32, 8 * net.IPv4len)
+	if r.IP.To4() == nil {
+		r.Mask = net.CIDRMask(128, 8 * net.IPv6len)
+	}
+	return r, nil
+}
+
 func (s *Status) parseUpdated(parts []string) error {
 	if parts[0] == "Updated" {
 		t, err := parseTime(parts[1])
@@ -109,6 +148,7 @@ func (s *Status) parseUnknown(text string) (readState, error) {
 var timeType = reflect.TypeOf(time.Time{})
 var addrType = reflect.TypeOf(Addr{})
 var netIPType = reflect.TypeOf(net.IP{})
+var routeAddrType = reflect.TypeOf(RouteAddr{})
 
 func parseStructParts(v reflect.Value, parts []string) error {
 	var f reflect.Value
@@ -151,6 +191,12 @@ func parseStructParts(v reflect.Value, parts []string) error {
 				p := net.ParseIP(parts[i])
 				if p == nil {
 					return errors.New("Invalid IP encountered")
+				}
+				f.Set(reflect.ValueOf(p))
+			case t.AssignableTo(routeAddrType):
+				p, err := parseRouteAddr(parts[i])
+				if err != nil {
+					return err
 				}
 				f.Set(reflect.ValueOf(p))
 			default:
@@ -214,7 +260,9 @@ func Parse(r io.Reader) (*Status, error) {
 	var t string
 	var err error
 	var cs readState
+	line := 0
 	for cs < stateEnd && scanner.Scan() {
+		line++
 		t = scanner.Text()
 		//first try and parse unknown/headers
 		if cs2, err2 := s.parseUnknown(t); err2 == nil {
@@ -234,7 +282,7 @@ func Parse(r io.Reader) (*Status, error) {
 			err = s.parseStats(t)
 		}
 		if err != nil {
-			return nil, err
+			return nil, errors.New(fmt.Sprintf("Error on line %d: %s", line, err))
 		}
 	}
 	err = scanner.Err()
