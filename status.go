@@ -47,16 +47,9 @@ type Route struct {
 	LastRef        time.Time
 }
 
-// Represents the OpenVPN status at a point in time
-type Status struct {
-	Updated  time.Time
-	Clients  []Client
-	Routes   []Route
-	MaxQueue uint64
-}
-
+// readState represents the current seciton/state of the Status as we
+// are parsing it
 type readState int
-
 const (
 	stateUnknown = iota
 	stateClients
@@ -65,10 +58,30 @@ const (
 	stateEnd
 )
 
+// Represents the OpenVPN status at a point in time
+type Status struct {
+	Updated  time.Time
+	Clients  []Client
+	Routes   []Route
+	MaxQueue uint64
+	state    readState
+}
+
+// parseFn is the type returned from parseLine and is used to further
+// process the line
+type parseFn func(*Status, string) error
+
+// EOF is returned when the end of the file is reached in parseLine
+var EOF = errors.New("EOF reached")
+
+// parseTime parses a string date time following the format:
+// Mon Jan 2 15:04:05 2006
+// it returns a Time struct
 func parseTime(text string) (time.Time, error) {
 	return time.Parse("Mon Jan 2 15:04:05 2006", text)
 }
 
+// parseAddr parses a string address and returns the resulting Addr
 func parseAddr(text string) (Addr, error) {
 	a := Addr{}
 	h, p, err := net.SplitHostPort(text)
@@ -86,6 +99,8 @@ func parseAddr(text string) (Addr, error) {
 	return a, nil
 }
 
+// parseRouteAddr parses a string route address and returns the resulting
+// RouteAddr struct
 func parseRouteAddr(text string) (RouteAddr, error) {
 	r := RouteAddr{}
 	// detect if this is a remote addr
@@ -115,43 +130,13 @@ func parseRouteAddr(text string) (RouteAddr, error) {
 	return r, nil
 }
 
-func (s *Status) parseUpdated(parts []string) error {
-	if parts[0] == "Updated" {
-		t, err := parseTime(parts[1])
-		if err == nil {
-			s.Updated = t
-		}
-		return err
-	}
-	return nil
-}
-
-func (s *Status) parseUnknown(text string) (readState, error) {
-	var cs readState
-	var err error
-	if text == "END" {
-		cs = stateEnd
-	} else if text == "" {
-		cs = stateUnknown
-	} else if strings.Contains(text, "CLIENT LIST") {
-		cs = stateClients
-	} else if strings.Contains(text, "ROUTING TABLE") {
-		cs = stateRoutes
-	} else if strings.Contains(text, "GLOBAL STATS") {
-		cs = stateStats
-	} else if strings.HasPrefix(text, "Updated,") {
-		s.Updated, err = parseTime(text[8:])
-	} else {
-		err = errors.New("Unexpected header text")
-	}
-	return cs, err
-}
-
 var timeType = reflect.TypeOf(time.Time{})
 var addrType = reflect.TypeOf(Addr{})
 var netIPType = reflect.TypeOf(net.IP{})
 var routeAddrType = reflect.TypeOf(RouteAddr{})
 
+// parseStructParts takes a struct and fills in the fields based on reflection
+// and the order of the []string slice passed in
 func parseStructParts(v reflect.Value, parts []string) error {
 	var f reflect.Value
 	for i := 0; i < v.NumField() && i < len(parts); i += 1 {
@@ -209,7 +194,25 @@ func parseStructParts(v reflect.Value, parts []string) error {
 	return nil
 }
 
-func (s *Status) parseClient(text string) error {
+// parseNothing is a placeholder function that does nothing
+func parseNothing(s *Status, text string) error {
+	return nil
+}
+
+// parseUpdated parses the "Updated," line
+func parseUpdated(s *Status, text string) error {
+	if text[0:7] == "Updated" {
+		t, err := parseTime(text[8:])
+		if err == nil {
+			s.Updated = t
+		}
+		return err
+	}
+	return nil
+}
+
+// parseClient parses lines in the CLIENT LIST section
+func parseClient(s *Status, text string) error {
 	parts := strings.Split(text, ",")
 	c := Client{}
 	v := reflect.ValueOf(&c).Elem()
@@ -226,7 +229,8 @@ func (s *Status) parseClient(text string) error {
 	return nil
 }
 
-func (s *Status) parseRoutes(text string) error {
+// parseRoute parses lines in the ROUTING TABLE section
+func parseRoute(s *Status, text string) error {
 	parts := strings.Split(text, ",")
 	c := Route{}
 	v := reflect.ValueOf(&c).Elem()
@@ -243,7 +247,8 @@ func (s *Status) parseRoutes(text string) error {
 	return nil
 }
 
-func (s *Status) parseStats(text string) error {
+// parseStat parses lines in the GLOBAL STATS section
+func parseStat(s *Status, text string) error {
 	parts := strings.Split(text, ",")
 	if strings.Contains(parts[0], "queue length") {
 		p, err := strconv.ParseUint(parts[1], 10, 64)
@@ -255,35 +260,66 @@ func (s *Status) parseStats(text string) error {
 	return nil
 }
 
+// parseLine accepts a string and returns the appropriate parse* function
+// for detailed, specific parsing of the line
+func (s *Status) parseLine(text string) (parseFn, error) {
+	var err error
+	// for all these section headers we want to return parseNothing since we
+	// just want to set the state from the header not actually process anything
+	fn := parseNothing
+	if text == "END" || text == "" {
+		s.state = stateEnd
+		err = EOF
+	} else if strings.Contains(text, "CLIENT LIST") {
+		s.state = stateClients
+	} else if strings.Contains(text, "ROUTING TABLE") {
+		s.state = stateRoutes
+	} else if strings.Contains(text, "GLOBAL STATS") {
+		s.state = stateStats
+	} else if strings.HasPrefix(text, "Updated,") {
+		// since updated is in the middle of a section do not change the state
+		fn = parseUpdated
+	} else {
+		// return the appropriate fn for the state we were in as determined by
+		// the last header
+		switch (s.state) {
+		case stateClients:
+			fn = parseClient
+		case stateRoutes:
+			fn = parseRoute
+		case stateStats:
+			fn = parseStat
+		case stateEnd:
+			fn = parseNothing
+		case stateUnknown:
+			fn = parseNothing
+			err = errors.New("Unexpected text encountered")
+		}
+	}
+
+	return fn, err
+}
+
 // Parses an io.Reader into a Status
 func Parse(r io.Reader) (*Status, error) {
 	s := &Status{}
 	scanner := bufio.NewScanner(r)
 	var t string
 	var err error
-	var cs readState
+	var fn parseFn
 	line := 0
-	for cs < stateEnd && scanner.Scan() {
+	for scanner.Scan() {
 		line++
 		t = scanner.Text()
-		//first try and parse unknown/headers
-		if cs2, err2 := s.parseUnknown(t); err2 == nil {
-			// only update state if its known
-			if cs2 > stateUnknown {
-				cs = cs2
-			}
-			//if we succeeded with parsing, skip this line
-			continue
-		}
-		switch cs {
-		case stateClients:
-			err = s.parseClient(t)
-		case stateRoutes:
-			err = s.parseRoutes(t)
-		case stateStats:
-			err = s.parseStats(t)
+		fn, err = s.parseLine(t)
+		if err == nil {
+			// parse the line using the returned function from parseLine
+			err = fn(s, t)
 		}
 		if err != nil {
+			if err == EOF {
+				break
+			}
 			return nil, errors.New(fmt.Sprintf("Error on line %d: %s", line, err))
 		}
 	}
